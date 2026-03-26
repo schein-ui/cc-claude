@@ -7,6 +7,7 @@ import json
 import re
 from pathlib import Path
 from datetime import datetime
+from collections import Counter
 
 # === Constants ===
 SESSIONS_DIR = Path.home() / ".claude" / "projects"
@@ -20,9 +21,25 @@ def dim(s):    return f"\033[2m{s}\033[0m" if USE_COLOR else s
 def green(s):  return f"\033[32m{s}\033[0m" if USE_COLOR else s
 def bold(s):   return f"\033[1m{s}\033[0m" if USE_COLOR else s
 def white(s):  return f"\033[97m{s}\033[0m" if USE_COLOR else s
+def cyan(s):   return f"\033[36m{s}\033[0m" if USE_COLOR else s
+def yellow(s): return f"\033[33m{s}\033[0m" if USE_COLOR else s
 
 
 # === Core Functions ===
+
+NOISE_PATTERNS = [
+    re.compile(r'<local-command-caveat>'),
+    re.compile(r'^Caveat: The messages below were generated'),
+    re.compile(r'^Unknown skill:'),
+    re.compile(r'^/\w+\s*$'),  # bare slash commands like "/voice"
+    re.compile(r'^\s*$'),
+]
+
+
+def is_noise(text):
+    """Check if a message is system noise rather than real user input."""
+    return any(p.search(text) for p in NOISE_PATTERNS)
+
 
 def extract_content(content):
     """Extract displayable text from message.content (str or list)."""
@@ -42,6 +59,16 @@ def extract_content(content):
 def auto_title(msg):
     """Generate a short descriptive title from the first user message."""
     text = msg.replace("\n", " ").strip()
+    # Strip XML-like tags (command messages, caveats, etc.)
+    text = re.sub(r'<[^>]+>', '', text).strip()
+    # Strip common noise prefixes (caveat messages from local commands)
+    text = re.sub(r'^Caveat:.*?(?:unless the user explicitly references them\.?\s*)', '', text, count=1).strip()
+    if not text or text.startswith("DO NOT"):
+        text = re.sub(r'^DO NOT respond.*?(?:references them\.?\s*)', '', text, count=1).strip()
+    # A bare file path as the message → use the filename
+    m_path = re.match(r'^(/\S+/)([^/\s]+)\s*$', text)
+    if m_path:
+        return f"Open {m_path.group(2)}"
 
     # "Implement the following plan: # Plan: Actual Title Here — ..."
     m = re.search(r'#\s*Plan:\s*(.+?)(?:\s*[—\-\n]|$)', text)
@@ -86,6 +113,41 @@ def auto_title(msg):
     return text[:60]
 
 
+def project_from_cwd(cwd):
+    """Extract a short project name from the working directory."""
+    if not cwd:
+        return None
+    home = str(Path.home())
+    if cwd == home:
+        return None  # home dir, no specific project
+    if cwd.startswith(home + "/"):
+        rel = cwd[len(home) + 1:]
+        # First path component is the project
+        return rel.split("/")[0]
+    return os.path.basename(cwd)
+
+
+def best_project(cwd_counts):
+    """Pick the best project from a counter of cwds seen in a session."""
+    home = str(Path.home())
+    # Prefer non-home directories
+    for cwd, _count in cwd_counts.most_common():
+        if cwd != home:
+            return project_from_cwd(cwd)
+    return None
+
+
+def size_indicator(user_turns):
+    """Return a size dot based on session depth."""
+    if user_turns <= 3:
+        return dim("·")    # tiny
+    if user_turns <= 15:
+        return dim("●")    # small
+    if user_turns <= 50:
+        return "●"         # medium
+    return bold("●")       # large
+
+
 def scan_sessions():
     """Scan all .jsonl files and extract session metadata."""
     sessions = []
@@ -100,6 +162,9 @@ def scan_sessions():
         slug = None
         timestamp = None
         first_message = None
+        cwd_counts = Counter()
+        user_turns = 0
+        last_timestamp = None
 
         try:
             with open(path) as f:
@@ -112,14 +177,21 @@ def scan_sessions():
                     if slug is None and "slug" in obj:
                         slug = obj["slug"]
 
-                    if obj.get("type") == "user" and first_message is None:
-                        content = extract_content(obj.get("message", {}).get("content"))
-                        if content:
-                            first_message = content
-                            timestamp = obj.get("timestamp")
+                    ts = obj.get("timestamp")
+                    if ts:
+                        last_timestamp = ts
 
-                    if first_message is not None and slug is not None:
-                        break
+                    cwd = obj.get("cwd")
+                    if cwd:
+                        cwd_counts[cwd] += 1
+
+                    if obj.get("type") == "user":
+                        user_turns += 1
+                        if first_message is None:
+                            content = extract_content(obj.get("message", {}).get("content"))
+                            if content and not is_noise(content):
+                                first_message = content
+                                timestamp = ts
         except (OSError, IOError):
             continue
 
@@ -127,12 +199,15 @@ def scan_sessions():
             sessions.append({
                 "session_id": session_id,
                 "timestamp": timestamp,
+                "last_active": last_timestamp or timestamp,
                 "first_message": first_message,
                 "title": auto_title(first_message),
                 "slug": slug,
+                "project": best_project(cwd_counts),
+                "user_turns": user_turns,
             })
 
-    sessions.sort(key=lambda s: s["timestamp"], reverse=True)
+    sessions.sort(key=lambda s: s["last_active"], reverse=True)
     return sessions
 
 
@@ -210,31 +285,48 @@ def get_display_name(session, tags):
 
 
 def format_session_line(num, session, tags):
-    date_str = format_date(session["timestamp"])
-    time_str = format_time(session["timestamp"])
+    last_date = format_date(session["last_active"])
+    last_time = format_time(session["last_active"])
     name = get_display_name(session, tags)
     is_tagged = session["session_id"] in tags
+    project = session.get("project")
+    turns = session.get("user_turns", 0)
 
     num_str = bold(str(num).rjust(3))
-    date_part = dim(f"{date_str}  {time_str}".ljust(16))
+    date_part = dim(f"{last_date}  {last_time}".ljust(16))
+    size = size_indicator(turns)
+
     if is_tagged:
         name_part = green(name)
     else:
         name_part = white(name)
 
-    return f"  {num_str}  {date_part}  {name_part}"
+    proj_part = f"  {cyan(project)}" if project else ""
+
+    return f"  {num_str}  {date_part}  {size} {name_part}{proj_part}"
 
 
 # === Commands ===
 
-def cmd_list(sessions, tags, interactive=True):
+def cmd_list(sessions, tags, interactive=True, project_filter=None):
+    if project_filter:
+        pf = project_filter.lower()
+        sessions = [s for s in sessions if (s.get("project") or "").lower().startswith(pf)]
+
     if not sessions:
-        print("No sessions found.")
+        if project_filter:
+            print(f"No sessions in project '{project_filter}'.")
+        else:
+            print("No sessions found.")
         return
 
-    oldest = sessions[-1]["timestamp"][:10]
-    newest = sessions[0]["timestamp"][:10]
-    print(bold(f"\n  {len(sessions)} sessions ({oldest} to {newest})\n"))
+    oldest = sessions[-1]["last_active"][:10]
+    newest = sessions[0]["last_active"][:10]
+    header = f"{len(sessions)} sessions"
+    if project_filter:
+        header += f" in {project_filter}"
+    header += f" ({oldest} to {newest})"
+    print(bold(f"\n  {header}\n"))
 
     for i, session in enumerate(sessions, 1):
         print(format_session_line(i, session, tags))
@@ -262,7 +354,8 @@ def cmd_search(sessions, tags, keyword):
         msg = session["first_message"].lower()
         tag = tags.get(session["session_id"], "").lower()
         title = (session.get("title") or "").lower()
-        if keyword_lower in msg or keyword_lower in tag or keyword_lower in title:
+        project = (session.get("project") or "").lower()
+        if keyword_lower in msg or keyword_lower in tag or keyword_lower in title or keyword_lower in project:
             matches.append((i, session))
 
     if not matches:
@@ -330,8 +423,9 @@ def print_help():
 cc - Claude Conversations
 
 Usage:
-  cc                          List all sessions (most recent first)
+  cc                          List all sessions (sorted by last active)
   cc <keyword>                Search sessions by keyword
+  cc @<project>               Filter by project directory
   cc tag <#> <name>           Tag a session with a friendly name
   cc resume [#]               Resume a session (interactive if no arg)
   cc help                     Show this help
@@ -341,8 +435,12 @@ Sessions can be identified by:
   - UUID or UUID prefix (e.g., 38a50c8e)
   - Tag name (e.g., crest-design)
 
+Each line shows:  #  last-active  size  title  project
+  Size: · tiny (≤3 turns)  ● small  ● medium  ● large (50+)
+
 Examples:
   cc brand                    Find sessions mentioning "brand"
+  cc @brand-builder           Show only brand-builder sessions
   cc tag 1 crest-design       Tag session #1
   cc resume crest-design      Resume by tag name
   cc resume                   Pick from list
@@ -367,6 +465,10 @@ def main():
     elif args[0] == "resume":
         identifier = args[1] if len(args) >= 2 else None
         cmd_resume(sessions, tags, identifier)
+    elif args[0].startswith("@"):
+        # @project filter: cc @brand-builder
+        project_filter = args[0][1:]
+        cmd_list(sessions, tags, project_filter=project_filter)
     else:
         # Unknown arg = search
         cmd_search(sessions, tags, " ".join(args))
