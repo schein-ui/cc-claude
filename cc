@@ -75,6 +75,41 @@ CODE_NOISE = frozenset({
     "first", "last", "next", "previous", "current",
     "same", "different", "specific", "general", "entire",
     "level", "similar", "existing", "repo",
+    "allow", "allowed", "allows", "remote", "phone", "call",
+    "hours", "minutes", "seconds", "time", "date", "day",
+    "server", "servers", "client", "port", "host",
+    "shot", "cant", "wont", "dont", "didnt", "doesnt",
+    "well", "good", "great", "bad", "thing", "stuff",
+    "sys", "bin", "tmp", "log", "logs", "pid",
+    "start", "stop", "done", "ready", "wait",
+    "yeah", "yep", "nah", "nope", "hmm", "huh",
+    "need", "needs", "got", "getting", "goes",
+    "know", "look", "looks", "feel", "feels",
+    "makes", "made", "takes", "took", "gives", "gave",
+    "version", "number", "count", "total", "list",
+    "going", "try", "trying", "using", "based",
+    "point", "part", "side", "line", "lines",
+    "issue", "problem", "bug", "fix", "fixed",
+    "please", "should", "would", "could",
+    "local", "global", "without", "within", "between", "across",
+    "control", "process", "system", "program", "running",
+    "three", "four", "five", "every", "many", "much",
+    "woudl", "teh", "hte", "taht", "adn", "wiht",  # common typos
+    "whats", "thats", "heres", "theres", "lets",
+    "pretty", "really", "quite", "super", "extra",
+    "assess", "grade", "grading", "graded", "grades",
+    "remote-control", "remote", "account", "studio",
+    "spending", "money", "cost", "price", "free", "paid",
+    "applicable", "available", "possible", "necessary",
+    "expression", "interval", "option", "options",
+    "instructions", "permissioning", "permission",
+    "launched", "awesome", "low-risk", "preview",
+    "perfect", "exactly", "correct", "wrong",
+    "specificity", "generality", "complexity",
+    "pick", "recurring", "smartest", "research",
+    "march", "april", "january", "february",
+    "carrie", "jeremy", "schein",  # personal names
+    "your-key-here", "anthropic_api_key",
 })
 
 # Exact user messages to ignore
@@ -245,17 +280,25 @@ def format_duration(start_iso, end_iso):
         return ""
 
 
-def extract_topic_keywords(user_messages):
-    """Extract meaningful topic words from user messages."""
+def extract_topic_keywords(user_messages, skip_first=True):
+    """Extract meaningful topic words from user messages.
+
+    Skips the first message (already used as title) and weights
+    early substantive messages higher than late meta-conversation.
+    """
     counts = Counter()
-    for msg in user_messages:
+    msgs = user_messages[1:] if skip_first and len(user_messages) > 1 else user_messages
+    for i, msg in enumerate(msgs):
         # Skip noise messages
-        if msg.strip().lower() in USER_NOISE:
+        stripped = msg.strip()
+        if stripped.lower() in USER_NOISE:
             continue
-        if msg.strip().startswith("<"):
+        if stripped.startswith("<"):
             continue
-        if len(msg.strip()) < 3:
+        if len(stripped) < 3:
             continue
+        # Weight: messages 1-5 get 3x, 6-10 get 2x, rest get 1x
+        weight = 3 if i < 5 else (2 if i < 10 else 1)
         # Clean and tokenize
         clean = re.sub(r'<[^>]+>', '', msg)  # strip XML tags
         clean = re.sub(r'https?://\S+', '', clean)  # strip URLs
@@ -267,11 +310,27 @@ def extract_topic_keywords(user_messages):
                 continue
             if low in STOPWORDS or low in ACTION_VERBS or low in CODE_NOISE:
                 continue
-            # Keep original case for acronyms (APEX, MLB, SVG)
-            if tok.isupper() and len(tok) >= 2:
-                counts[tok] += 1
+            # Skip short generic tokens (keep known acronyms: API, MLB, NPM, etc.)
+            KNOWN_ACRONYMS = {"api", "mlb", "npm", "mcp", "sme", "svg", "css",
+                              "sql", "cli", "sdk", "cdn", "dns", "jwt", "aws",
+                              "gcp", "llm", "ux", "ui", "pr", "ci", "cd"}
+            if len(low) <= 3 and low not in KNOWN_ACRONYMS:
+                continue
+            # Skip likely typos: words with unusual letter patterns
+            # (no vowels, or mostly consonant clusters)
+            vowels = sum(1 for c in low if c in "aeiou")
+            if len(low) >= 4 and vowels == 0:
+                continue  # no vowels = likely garbage
+            if low.endswith("ign") or low.endswith("oin") or low.endswith("odl"):
+                continue  # common typo patterns: "workign", "sessoin", "woudl"
+            # Skip words with 3+ consecutive consonants that aren't common
+            if re.search(r'[^aeiou]{4,}', low) and low not in KNOWN_ACRONYMS:
+                continue  # "braodly", "btwn" etc.
+            # Keep original case for known acronyms only
+            if tok.isupper() and len(tok) <= 5 and len(tok) >= 2 and low in KNOWN_ACRONYMS:
+                counts[tok] += weight
             else:
-                counts[low] += 1
+                counts[low] += weight
     return counts
 
 
@@ -298,46 +357,63 @@ def extract_path_keywords(files_edited, files_created):
     return counts
 
 
-def build_summary(user_messages, files_edited, files_created, bash_descriptions, plan_title=None):
-    """Build a concise topic-based summary of what the session was about."""
+def _normalize_keyword(word):
+    """Normalize plurals and common suffixes to reduce duplication."""
+    low = word.lower()
+    # Simple plural stripping (skills->skill, events->event, agents->agent)
+    if low.endswith("s") and len(low) > 4 and not low.endswith("ss"):
+        return low[:-1]
+    return low
+
+
+def build_summary(user_messages, files_edited, files_created, bash_descriptions,
+                  plan_title=None, title="", project=""):
+    """Build a concise 3-4 term summary that complements the title line."""
     # Best case: plan title exists
     if plan_title:
         return plan_title[:80]
 
-    # Extract topic keywords from user messages
-    topic_counts = extract_topic_keywords(user_messages)
+    # Extract topic keywords (skip first message — it's the title)
+    topic_counts = extract_topic_keywords(user_messages, skip_first=True)
 
     # Extract keywords from file paths (lower weight)
     path_counts = extract_path_keywords(files_edited, files_created)
     for word, count in path_counts.items():
-        topic_counts[word] += count // 2 or 1  # half weight
+        topic_counts[word] += count // 2 or 1
 
     if not topic_counts:
         return ""
 
-    # Merge case variants: prefer uppercase if it's an acronym, else lowercase
+    # Merge case variants and normalize plurals
     merged = Counter()
     best_form = {}
     for word, count in topic_counts.items():
-        low = word.lower()
-        merged[low] += count
-        # Prefer the uppercase form if it looks like an acronym
-        if low not in best_form:
-            best_form[low] = word
-        elif word.isupper() and not best_form[low].isupper():
-            best_form[low] = word
+        norm = _normalize_keyword(word)
+        merged[norm] += count
+        if norm not in best_form:
+            best_form[norm] = word
+        elif word.isupper() and not best_form[norm].isupper():
+            best_form[norm] = word
 
-    # Get top keywords
-    top = merged.most_common(8)
-    keywords = [best_form[low] for low, _ in top]
+    # Remove words already in the title or project name (avoid redundancy)
+    title_words = set(re.findall(r"[a-zA-Z]{3,}", (title + " " + project).lower()))
+    for tw in title_words:
+        norm = _normalize_keyword(tw)
+        merged.pop(norm, None)
 
-    # Build summary
+    if not merged:
+        return ""
+
+    # Take only top 4 keywords (scannable, not a word cloud)
+    top = merged.most_common(4)
+    keywords = [best_form[norm] for norm, _ in top]
+
     summary = ", ".join(keywords)
 
-    # Truncate at comma boundary around 65 chars
-    if len(summary) > 65:
-        cut = summary[:65].rfind(",")
-        if cut > 20:
+    # Truncate at comma boundary around 55 chars
+    if len(summary) > 55:
+        cut = summary[:55].rfind(",")
+        if cut > 10:
             summary = summary[:cut]
 
     return summary
@@ -433,16 +509,21 @@ def scan_sessions():
 
         if first_message and timestamp:
             duration = format_duration(timestamp, last_timestamp or timestamp)
-            summary = build_summary(user_messages, files_edited, files_created, bash_descriptions, plan_title)
+            session_title = auto_title(first_message)
+            session_project = best_project(cwd_counts) or ""
+            summary = build_summary(
+                user_messages, files_edited, files_created, bash_descriptions,
+                plan_title, title=session_title, project=session_project,
+            )
             sessions.append({
                 "session_id": session_id,
                 "timestamp": timestamp,
                 "last_active": last_timestamp or timestamp,
                 "first_message": first_message,
-                "title": auto_title(first_message),
+                "title": session_title,
                 "summary": summary,
                 "slug": slug,
-                "project": best_project(cwd_counts),
+                "project": session_project or None,
                 "user_turns": user_turns,
                 "assistant_turns": assistant_turns,
                 "duration": duration,
