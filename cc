@@ -148,6 +148,95 @@ def size_indicator(user_turns):
     return bold("●")       # large
 
 
+def format_duration(start_iso, end_iso):
+    """Return a human-readable duration string between two ISO timestamps."""
+    try:
+        start = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+        end = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+        delta = end - start
+        total_secs = int(delta.total_seconds())
+        if total_secs < 60:
+            return "<1m"
+        if total_secs < 3600:
+            return f"{total_secs // 60}m"
+        hours = total_secs // 3600
+        mins = (total_secs % 3600) // 60
+        if mins:
+            return f"{hours}h {mins}m"
+        return f"{hours}h"
+    except (ValueError, OSError):
+        return ""
+
+
+def short_path(fp):
+    """Shorten a file path for display."""
+    home = str(Path.home())
+    if fp.startswith(home + "/"):
+        fp = fp[len(home) + 1:]
+    # Further shorten: just filename if path is long
+    parts = fp.split("/")
+    if len(parts) > 3:
+        return f".../{'/'.join(parts[-2:])}"
+    return fp
+
+
+def build_summary(user_messages, files_edited, files_created, bash_descriptions):
+    """Build a concise summary of what happened in the session."""
+    parts = []
+
+    # 1. Best signal: bash command descriptions (Claude wrote these as clean English)
+    if bash_descriptions:
+        unique_descs = []
+        seen = set()
+        for d in bash_descriptions:
+            # Normalize and dedup
+            dl = d.lower().strip()
+            # Skip generic ones
+            if dl in seen or dl in ("list files in current directory", "show working tree status"):
+                continue
+            seen.add(dl)
+            unique_descs.append(d)
+        # Pick the most descriptive ones (longer = more specific)
+        unique_descs.sort(key=len, reverse=True)
+        top = unique_descs[:3]
+        if top:
+            parts.append("; ".join(top))
+
+    # 2. Files touched — compact summary
+    all_files = set()
+    for fp in files_edited:
+        all_files.add(short_path(fp))
+    for fp in files_created:
+        all_files.add(short_path(fp))
+
+    if all_files:
+        if len(all_files) <= 3:
+            parts.append(", ".join(sorted(all_files)))
+        else:
+            exts = Counter()
+            dirs = Counter()
+            for f in all_files:
+                ext = os.path.splitext(f)[1]
+                if ext:
+                    exts[ext] += 1
+                d = os.path.dirname(f)
+                if d:
+                    # Use just the last dir component
+                    dirs[os.path.basename(d)] += 1
+            file_summary = f"{len(all_files)} files"
+            # Show top directories
+            top_dirs = [d for d, _ in dirs.most_common(2)]
+            if top_dirs:
+                file_summary += f" in {', '.join(top_dirs)}"
+            else:
+                ext_str = ", ".join(f"{e}" for e, c in exts.most_common(3))
+                if ext_str:
+                    file_summary += f" ({ext_str})"
+            parts.append(file_summary)
+
+    return " · ".join(parts) if parts else ""
+
+
 def scan_sessions():
     """Scan all .jsonl files and extract session metadata."""
     sessions = []
@@ -162,9 +251,16 @@ def scan_sessions():
         slug = None
         timestamp = None
         first_message = None
+        user_messages = []
         cwd_counts = Counter()
         user_turns = 0
         last_timestamp = None
+        tools_used = set()
+        assistant_turns = 0
+        files_edited = set()
+        files_created = set()
+        bash_descriptions = []
+        key_topics = set()
 
         try:
             with open(path) as f:
@@ -187,24 +283,58 @@ def scan_sessions():
 
                     if obj.get("type") == "user":
                         user_turns += 1
-                        if first_message is None:
-                            content = extract_content(obj.get("message", {}).get("content"))
-                            if content and not is_noise(content):
+                        content = extract_content(obj.get("message", {}).get("content"))
+                        if content and not is_noise(content):
+                            if first_message is None:
                                 first_message = content
                                 timestamp = ts
+                            if len(user_messages) < 20:
+                                user_messages.append(content)
+
+                    if obj.get("type") == "assistant":
+                        assistant_turns += 1
+                        msg = obj.get("message", {})
+                        content = msg.get("content", [])
+                        if isinstance(content, list):
+                            for item in content:
+                                if isinstance(item, dict) and item.get("type") == "tool_use":
+                                    tool_name = item.get("name", "")
+                                    tools_used.add(tool_name)
+                                    inp = item.get("input", {})
+                                    # Track files edited/created
+                                    if tool_name == "Edit":
+                                        fp = inp.get("file_path", "")
+                                        if fp:
+                                            files_edited.add(fp)
+                                    elif tool_name == "Write":
+                                        fp = inp.get("file_path", "")
+                                        if fp:
+                                            files_created.add(fp)
+                                    elif tool_name == "Bash":
+                                        desc = inp.get("description", "")
+                                        if desc and len(bash_descriptions) < 30:
+                                            bash_descriptions.append(desc)
         except (OSError, IOError):
             continue
 
         if first_message and timestamp:
+            duration = format_duration(timestamp, last_timestamp or timestamp)
+            summary = build_summary(user_messages, files_edited, files_created, bash_descriptions)
             sessions.append({
                 "session_id": session_id,
                 "timestamp": timestamp,
                 "last_active": last_timestamp or timestamp,
                 "first_message": first_message,
                 "title": auto_title(first_message),
+                "summary": summary,
                 "slug": slug,
                 "project": best_project(cwd_counts),
                 "user_turns": user_turns,
+                "assistant_turns": assistant_turns,
+                "duration": duration,
+                "tools_used": sorted(tools_used - {""}),
+                "files_edited": sorted(files_edited),
+                "files_created": sorted(files_created),
             })
 
     sessions.sort(key=lambda s: s["last_active"], reverse=True)
@@ -284,6 +414,33 @@ def get_display_name(session, tags):
     return session.get("title") or truncate(session["first_message"], 50)
 
 
+TOOL_LABELS = {
+    "Read": "read",
+    "Write": "write",
+    "Edit": "edit",
+    "Bash": "bash",
+    "Glob": "glob",
+    "Grep": "grep",
+    "Agent": "agent",
+    "WebSearch": "web",
+    "WebFetch": "web",
+}
+
+
+def format_tools(tools):
+    """Return a compact summary of tools used."""
+    labels = set()
+    for t in tools:
+        label = TOOL_LABELS.get(t)
+        if label:
+            labels.add(label)
+        elif t.startswith("mcp__"):
+            labels.add("mcp")
+    if not labels:
+        return ""
+    return ", ".join(sorted(labels))
+
+
 def format_session_line(num, session, tags):
     last_date = format_date(session["last_active"])
     last_time = format_time(session["last_active"])
@@ -291,6 +448,8 @@ def format_session_line(num, session, tags):
     is_tagged = session["session_id"] in tags
     project = session.get("project")
     turns = session.get("user_turns", 0)
+    duration = session.get("duration", "")
+    tools = session.get("tools_used", [])
 
     num_str = bold(str(num).rjust(3))
     date_part = dim(f"{last_date}  {last_time}".ljust(16))
@@ -303,7 +462,34 @@ def format_session_line(num, session, tags):
 
     proj_part = f"  {cyan(project)}" if project else ""
 
-    return f"  {num_str}  {date_part}  {size} {name_part}{proj_part}"
+    summary = session.get("summary", "")
+
+    # Line 1: number, date, title, project
+    line1 = f"  {num_str}  {date_part}  {size} {name_part}{proj_part}"
+
+    # Line 2: stats — turns, duration, tools
+    stats = []
+    stats.append(f"{turns} turns")
+    if duration:
+        stats.append(duration)
+    tool_str = format_tools(tools)
+    if tool_str:
+        stats.append(tool_str)
+    line2 = f"        {dim(' · '.join(stats))}"
+
+    lines = [line1, line2]
+
+    # Line 3: summary of what happened
+    if summary:
+        # Truncate to terminal width
+        summary_display = summary[:90]
+        if len(summary) > 90:
+            summary_display += "..."
+        lines.append(f"        {yellow(summary_display)}")
+
+    lines.append("")  # blank line between sessions
+
+    return "\n".join(lines)
 
 
 # === Commands ===
