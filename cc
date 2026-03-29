@@ -14,6 +14,83 @@ SESSIONS_DIR = Path.home() / ".claude" / "projects"
 TAGS_FILE = Path.home() / ".claude" / "session-tags.json"
 MAX_MSG_LEN = 80
 
+# Words that don't carry topic meaning
+STOPWORDS = frozenset({
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "shall", "can", "need", "must",
+    "i", "you", "we", "they", "he", "she", "it", "me", "my", "your",
+    "our", "their", "its", "this", "that", "these", "those",
+    "what", "which", "who", "whom", "where", "when", "how", "why",
+    "not", "no", "yes", "ok", "okay", "sure", "yeah", "just", "also",
+    "and", "or", "but", "if", "then", "than", "so", "too", "very",
+    "of", "in", "on", "at", "to", "for", "with", "from", "by", "about",
+    "into", "through", "up", "out", "down", "off", "over", "under",
+    "all", "any", "some", "each", "every", "both", "few", "more",
+    "other", "new", "now", "here", "there", "don", "doesn", "didn",
+    "won", "wouldn", "couldn", "shouldn", "let", "lets", "get",
+    "like", "going", "want", "right", "way", "thing", "things",
+    "really", "actually", "still", "already", "back", "much",
+})
+
+# Verbs that describe actions but not topics
+ACTION_VERBS = frozenset({
+    "run", "make", "do", "try", "check", "look", "see", "go", "use",
+    "put", "take", "give", "tell", "show", "find", "keep", "think",
+    "know", "want", "like", "come", "turn", "work", "call", "move",
+    "set", "add", "change", "start", "open", "close", "read", "write",
+    "pull", "push", "test", "update", "install", "commit", "resume",
+    "please", "help", "implement", "following", "plan",
+    "create", "build", "fix", "design", "search", "review",
+    "download", "delete", "remove", "rename", "copy", "paste",
+    "save", "load", "import", "export", "send", "receive",
+})
+
+# Code/schema tokens that leak from structured content
+CODE_NOISE = frozenset({
+    "type", "string", "description", "required", "default", "null",
+    "true", "false", "boolean", "number", "object", "array",
+    "json", "yaml", "xml", "html", "css", "http", "https",
+    "file", "files", "path", "dir", "name", "value", "key",
+    "error", "status", "data", "input", "output", "result",
+    "command", "message", "content", "text", "param", "params",
+    "settings", "config", "options", "args", "env", "var",
+    "completed", "running", "pending", "failed", "success",
+    "task", "tasks", "hook", "hooks", "says",
+    "tool", "tools", "source", "properties", "items", "item",
+    "only", "bash", "edit", "glob", "grep", "agent", "agents",
+    "user", "users", "mode", "auto", "prompt", "prompts",
+    "claude", "CLAUDE", "session", "sessions",
+    "rule", "rules", "order", "request", "response",
+    "login", "working", "enable-auto-mode", "auto-mode",
+    "interrupted", "continue", "recent",
+    "const", "let", "var", "function", "class", "return", "async",
+    "await", "import", "require", "module", "exports", "define",
+    "model", "schema", "interface", "enum", "struct",
+    "posttooluse", "pretooluse", "matcher", "callback", "handler",
+    "runs", "after", "before", "above", "below",
+    "permission", "allowed", "denied", "granted",
+    "most", "that's", "i'm", "it's", "don't", "can't", "won't",
+    "didn't", "doesn't", "isn't", "aren't", "wasn't", "weren't",
+    "first", "last", "next", "previous", "current",
+    "same", "different", "specific", "general", "entire",
+    "level", "similar", "existing", "repo",
+})
+
+# Exact user messages to ignore
+USER_NOISE = frozenset({
+    "auto mode", "auto", "cc", "claude", "claude code", "test", "yes",
+    "no", "ok", "okay", "sure", "thanks", "thank you", "-", "done",
+    "continue", "go", "next", "stop", "wait", "undo", "cancel",
+})
+
+# Generic path components to skip
+GENERIC_PATH_PARTS = frozenset({
+    "src", "app", "lib", "dist", "build", "output", "outputs", "node_modules",
+    "index", "__init__", "route", "page", "layout", "main", "utils", "helpers",
+    "services", "components", "public", "static", "assets", "config", "scripts",
+})
+
 # === Color Helpers ===
 USE_COLOR = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
 
@@ -168,73 +245,102 @@ def format_duration(start_iso, end_iso):
         return ""
 
 
-def short_path(fp):
-    """Shorten a file path for display."""
-    home = str(Path.home())
-    if fp.startswith(home + "/"):
-        fp = fp[len(home) + 1:]
-    # Further shorten: just filename if path is long
-    parts = fp.split("/")
-    if len(parts) > 3:
-        return f".../{'/'.join(parts[-2:])}"
-    return fp
-
-
-def build_summary(user_messages, files_edited, files_created, bash_descriptions):
-    """Build a concise summary of what happened in the session."""
-    parts = []
-
-    # 1. Best signal: bash command descriptions (Claude wrote these as clean English)
-    if bash_descriptions:
-        unique_descs = []
-        seen = set()
-        for d in bash_descriptions:
-            # Normalize and dedup
-            dl = d.lower().strip()
-            # Skip generic ones
-            if dl in seen or dl in ("list files in current directory", "show working tree status"):
+def extract_topic_keywords(user_messages):
+    """Extract meaningful topic words from user messages."""
+    counts = Counter()
+    for msg in user_messages:
+        # Skip noise messages
+        if msg.strip().lower() in USER_NOISE:
+            continue
+        if msg.strip().startswith("<"):
+            continue
+        if len(msg.strip()) < 3:
+            continue
+        # Clean and tokenize
+        clean = re.sub(r'<[^>]+>', '', msg)  # strip XML tags
+        clean = re.sub(r'https?://\S+', '', clean)  # strip URLs
+        clean = re.sub(r'[/\\]\S+', '', clean)  # strip file paths
+        tokens = re.findall(r"[a-zA-Z][\w'-]*", clean)
+        for tok in tokens:
+            low = tok.lower()
+            if len(low) < 3:
                 continue
-            seen.add(dl)
-            unique_descs.append(d)
-        # Pick the most descriptive ones (longer = more specific)
-        unique_descs.sort(key=len, reverse=True)
-        top = unique_descs[:3]
-        if top:
-            parts.append("; ".join(top))
-
-    # 2. Files touched — compact summary
-    all_files = set()
-    for fp in files_edited:
-        all_files.add(short_path(fp))
-    for fp in files_created:
-        all_files.add(short_path(fp))
-
-    if all_files:
-        if len(all_files) <= 3:
-            parts.append(", ".join(sorted(all_files)))
-        else:
-            exts = Counter()
-            dirs = Counter()
-            for f in all_files:
-                ext = os.path.splitext(f)[1]
-                if ext:
-                    exts[ext] += 1
-                d = os.path.dirname(f)
-                if d:
-                    # Use just the last dir component
-                    dirs[os.path.basename(d)] += 1
-            file_summary = f"{len(all_files)} files"
-            # Show top directories
-            top_dirs = [d for d, _ in dirs.most_common(2)]
-            if top_dirs:
-                file_summary += f" in {', '.join(top_dirs)}"
+            if low in STOPWORDS or low in ACTION_VERBS or low in CODE_NOISE:
+                continue
+            # Keep original case for acronyms (APEX, MLB, SVG)
+            if tok.isupper() and len(tok) >= 2:
+                counts[tok] += 1
             else:
-                ext_str = ", ".join(f"{e}" for e, c in exts.most_common(3))
-                if ext_str:
-                    file_summary += f" ({ext_str})"
-            parts.append(file_summary)
+                counts[low] += 1
+    return counts
 
-    return " · ".join(parts) if parts else ""
+
+def extract_path_keywords(files_edited, files_created):
+    """Extract meaningful topic words from file paths."""
+    counts = Counter()
+    home = str(Path.home())
+    for fp in list(files_edited) + list(files_created):
+        if fp.startswith(home + "/"):
+            fp = fp[len(home) + 1:]
+        # Skip .claude internal files
+        if fp.startswith(".claude"):
+            continue
+        parts = fp.split("/")
+        for part in parts:
+            name = os.path.splitext(part)[0]  # strip extension
+            # Split hyphenated/underscored names
+            subparts = re.split(r'[-_.]', name)
+            for sp in subparts:
+                low = sp.lower()
+                if len(low) < 3 or low in GENERIC_PATH_PARTS:
+                    continue
+                counts[low] += 1
+    return counts
+
+
+def build_summary(user_messages, files_edited, files_created, bash_descriptions, plan_title=None):
+    """Build a concise topic-based summary of what the session was about."""
+    # Best case: plan title exists
+    if plan_title:
+        return plan_title[:80]
+
+    # Extract topic keywords from user messages
+    topic_counts = extract_topic_keywords(user_messages)
+
+    # Extract keywords from file paths (lower weight)
+    path_counts = extract_path_keywords(files_edited, files_created)
+    for word, count in path_counts.items():
+        topic_counts[word] += count // 2 or 1  # half weight
+
+    if not topic_counts:
+        return ""
+
+    # Merge case variants: prefer uppercase if it's an acronym, else lowercase
+    merged = Counter()
+    best_form = {}
+    for word, count in topic_counts.items():
+        low = word.lower()
+        merged[low] += count
+        # Prefer the uppercase form if it looks like an acronym
+        if low not in best_form:
+            best_form[low] = word
+        elif word.isupper() and not best_form[low].isupper():
+            best_form[low] = word
+
+    # Get top keywords
+    top = merged.most_common(8)
+    keywords = [best_form[low] for low, _ in top]
+
+    # Build summary
+    summary = ", ".join(keywords)
+
+    # Truncate at comma boundary around 65 chars
+    if len(summary) > 65:
+        cut = summary[:65].rfind(",")
+        if cut > 20:
+            summary = summary[:cut]
+
+    return summary
 
 
 def scan_sessions():
@@ -260,7 +366,7 @@ def scan_sessions():
         files_edited = set()
         files_created = set()
         bash_descriptions = []
-        key_topics = set()
+        plan_title = None
 
         try:
             with open(path) as f:
@@ -272,6 +378,14 @@ def scan_sessions():
 
                     if slug is None and "slug" in obj:
                         slug = obj["slug"]
+
+                    # Extract plan title if present
+                    if plan_title is None and "planContent" in obj:
+                        pc = obj["planContent"]
+                        if pc:
+                            m = re.search(r'#\s*Plan:\s*(.+?)(?:\s*[\n—\-]|$)', pc)
+                            if m:
+                                plan_title = m.group(1).strip()
 
                     ts = obj.get("timestamp")
                     if ts:
@@ -319,7 +433,7 @@ def scan_sessions():
 
         if first_message and timestamp:
             duration = format_duration(timestamp, last_timestamp or timestamp)
-            summary = build_summary(user_messages, files_edited, files_created, bash_descriptions)
+            summary = build_summary(user_messages, files_edited, files_created, bash_descriptions, plan_title)
             sessions.append({
                 "session_id": session_id,
                 "timestamp": timestamp,
