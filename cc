@@ -110,6 +110,12 @@ CODE_NOISE = frozenset({
     "march", "april", "january", "february",
     "carrie", "jeremy", "schein",  # personal names
     "your-key-here", "anthropic_api_key",
+    "autonomously", "approves", "actions", "approved",
+    "croncreate", "crondelete", "cronlist",
+    "days", "pushes", "execution",
+    "against", "ones", "escalates", "higher-risk",
+    "implementation", "approach", "strategy",
+    "phases", "phase", "deliverable", "deliverables",
 })
 
 # Exact user messages to ignore
@@ -120,6 +126,13 @@ USER_NOISE = frozenset({
 })
 
 # Generic path components to skip
+KNOWN_ACRONYMS = frozenset({
+    "api", "mlb", "npm", "mcp", "sme", "svg", "css",
+    "sql", "cli", "sdk", "cdn", "dns", "jwt", "aws",
+    "gcp", "llm", "ux", "ui", "pr", "ci", "cd",
+    "dtc", "nyc", "nfl", "nba", "ip", "url",
+})
+
 GENERIC_PATH_PARTS = frozenset({
     "src", "app", "lib", "dist", "build", "output", "outputs", "node_modules",
     "index", "__init__", "route", "page", "layout", "main", "utils", "helpers",
@@ -310,10 +323,7 @@ def extract_topic_keywords(user_messages, skip_first=True):
                 continue
             if low in STOPWORDS or low in ACTION_VERBS or low in CODE_NOISE:
                 continue
-            # Skip short generic tokens (keep known acronyms: API, MLB, NPM, etc.)
-            KNOWN_ACRONYMS = {"api", "mlb", "npm", "mcp", "sme", "svg", "css",
-                              "sql", "cli", "sdk", "cdn", "dns", "jwt", "aws",
-                              "gcp", "llm", "ux", "ui", "pr", "ci", "cd"}
+            # Skip short generic tokens (keep known acronyms)
             if len(low) <= 3 and low not in KNOWN_ACRONYMS:
                 continue
             # Skip likely typos: words with unusual letter patterns
@@ -366,6 +376,31 @@ def _normalize_keyword(word):
     return low
 
 
+def extract_bash_nouns(bash_descriptions):
+    """Extract domain-specific nouns from bash command descriptions.
+
+    Bash descriptions are written by Claude in clean English like
+    'Install Inkscape for SVG conversion' — the nouns carry domain signal.
+    """
+    counts = Counter()
+    for desc in bash_descriptions:
+        tokens = re.findall(r"[a-zA-Z][\w'-]*", desc)
+        for tok in tokens:
+            low = tok.lower()
+            if len(low) < 4:
+                continue
+            if low in STOPWORDS or low in ACTION_VERBS or low in CODE_NOISE:
+                continue
+            # Skip generic bash description words
+            if low in {"command", "current", "directory", "latest", "check",
+                       "verify", "confirm", "install", "reinstall", "test",
+                       "output", "updated", "status", "working", "tree",
+                       "files", "list", "show", "display", "fetch", "search"}:
+                continue
+            counts[low] += 1
+    return counts
+
+
 def build_summary(user_messages, files_edited, files_created, bash_descriptions,
                   plan_title=None, title="", project=""):
     """Build a concise 3-4 term summary that complements the title line."""
@@ -381,8 +416,13 @@ def build_summary(user_messages, files_edited, files_created, bash_descriptions,
     for word, count in path_counts.items():
         topic_counts[word] += count // 2 or 1
 
-    if not topic_counts:
-        return ""
+    # Cross-reference with bash description nouns (boost shared terms)
+    bash_nouns = extract_bash_nouns(bash_descriptions)
+    for word, count in bash_nouns.items():
+        if word in topic_counts:
+            topic_counts[word] += count * 2  # boost terms that appear in both
+        else:
+            topic_counts[word] += count // 2 or 1  # low weight for bash-only
 
     # Merge case variants and normalize plurals
     merged = Counter()
@@ -401,7 +441,22 @@ def build_summary(user_messages, files_edited, files_created, bash_descriptions,
         norm = _normalize_keyword(tw)
         merged.pop(norm, None)
 
+    # Apply minimum frequency threshold: weighted count >= 2
+    # This naturally filters one-off noise words
+    merged = Counter({k: v for k, v in merged.items() if v >= 2})
+
     if not merged:
+        # Fallback: use the most descriptive bash description
+        if bash_descriptions:
+            # Pick the longest description (most specific)
+            best_desc = sorted(bash_descriptions, key=len, reverse=True)
+            for desc in best_desc:
+                # Skip generic descriptions
+                dl = desc.lower()
+                if any(skip in dl for skip in ["list files", "show working",
+                                                "show tree", "check current"]):
+                    continue
+                return desc[:60]
         return ""
 
     # Take only top 4 keywords (scannable, not a word cloud)
