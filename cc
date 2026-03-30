@@ -438,7 +438,13 @@ _INTENT_RE = re.compile(
     r'\b(improve|refine|optimize|fix|build|create|configure|setup|set up|'
     r'migrate|deploy|design|implement|install|upgrade|scaffold|'
     r'review|analyze|debug|rewrite|restructure|convert|extract|generate|'
-    r'simulate|stream|download)\b\s+(.+)',
+    r'simulate|stream|download|enable|turn on|activate)\b\s+(.+)',
+    re.IGNORECASE
+)
+
+# "I want to X" / "I need to X" patterns — strong purpose signals
+_WANT_RE = re.compile(
+    r'i\s+(?:want|need|would like|wanna|\'d like)\s+(?:you\s+)?(?:to\s+)?(.{15,})',
     re.IGNORECASE
 )
 
@@ -449,6 +455,15 @@ def _extract_intent(snippet):
     Only returns a match if the object is substantial enough to be a purpose
     statement (15+ chars). Short matches like 'run it' are skipped.
     """
+    # Try "I want to X" first — strongest purpose signal
+    m = _WANT_RE.search(snippet)
+    if m:
+        obj = m.group(1).strip()
+        obj = re.split(r'[.!?\n]', obj)[0].strip()
+        if len(obj) >= 15:
+            return obj[:75]
+
+    # Try intent verb + object
     m = _INTENT_RE.search(snippet)
     if m:
         verb = m.group(1).lower()
@@ -472,40 +487,62 @@ def build_summary(user_messages, files_edited, files_created, bash_descriptions,
     if plan_title:
         return plan_title[:80]
 
-    # 2. Collect cleaned user message snippets (skip first — it's the title)
+    # 2. Also try the first message (title source) — for short sessions it IS the purpose
+    first_intent = None
+    if user_messages:
+        first_snippet = _clean_user_snippet(user_messages[0])
+        if first_snippet:
+            first_intent = _extract_intent(first_snippet)
+
+    # 3. Collect cleaned user message snippets from messages 2+
     snippets = []
     title_low = (title + " " + project).lower()
     for msg in user_messages[1:20]:
         snippet = _clean_user_snippet(msg)
         if not snippet:
             continue
-        # Skip if it's basically the same as the title
         if snippet.lower().strip() == title_low.strip():
             continue
         if len(snippet) < 12:
             continue
         snippets.append(snippet)
 
-    # 3. Collect ALL intent phrases, then pick the best (longest = most descriptive)
+    # 4. Collect ALL intent phrases from later messages, pick the longest
     intents = []
     for snippet in snippets:
         intent = _extract_intent(snippet)
         if intent:
             intents.append(intent)
+
     if intents:
-        # Longest intent is most likely the real purpose statement
         best_intent = max(intents, key=len)
         return best_intent
 
-    # 4. Try the first substantive bash description — captures what Claude did
+    # 5. If no intent from later messages, try the first message's intent
+    if first_intent:
+        return first_intent
+
+    # 6. Try the first substantive bash description
     bash_summary = _first_bash_description(bash_descriptions)
+
+    # 7. Fallback: longest snippet from first 5 messages (where purpose lives)
+    early_candidates = [s for s in snippets[:5] if len(s) >= 20]
+    if early_candidates:
+        best_snippet = max(early_candidates, key=len)[:75]
+        # If bash description exists and is more specific, prefer it
+        if bash_summary and len(bash_summary) > len(best_snippet):
+            return bash_summary
+        return best_snippet
+
     if bash_summary:
         return bash_summary
 
-    # 5. Fallback: longest clean snippet
-    candidates = [s for s in snippets if len(s) >= 20]
-    if candidates:
-        return max(candidates, key=len)[:75]
+    # 8. Last resort: any snippet that's actually informative (20+ chars, not a question)
+    if snippets:
+        informative = [s for s in snippets if len(s) >= 20 and not s.strip().endswith("?")
+                       and not s.lower().startswith(("it sys", "the remote", "how do"))]
+        if informative:
+            return max(informative, key=len)[:75]
 
     return ""
 
