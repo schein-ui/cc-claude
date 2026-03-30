@@ -838,7 +838,8 @@ def cmd_search(sessions, tags, keyword):
         tag = tags.get(session["session_id"], "").lower()
         title = (session.get("title") or "").lower()
         project = (session.get("project") or "").lower()
-        if keyword_lower in msg or keyword_lower in tag or keyword_lower in title or keyword_lower in project:
+        summary = (session.get("summary") or "").lower()
+        if keyword_lower in msg or keyword_lower in tag or keyword_lower in title or keyword_lower in project or keyword_lower in summary:
             matches.append((i, session))
 
     if not matches:
