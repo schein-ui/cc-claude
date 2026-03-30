@@ -376,102 +376,108 @@ def _normalize_keyword(word):
     return low
 
 
-def extract_bash_nouns(bash_descriptions):
-    """Extract domain-specific nouns from bash command descriptions.
+def _clean_user_snippet(msg):
+    """Clean a user message into a short readable snippet."""
+    text = msg.replace("\n", " ").strip()
+    text = re.sub(r'<[^>]+>', '', text).strip()  # strip XML tags
+    text = re.sub(r'https?://\S+', '', text).strip()  # strip URLs
+    text = re.sub(r'[/\\]\S+/\S+', '', text).strip()  # strip file paths
+    text = re.sub(r'^Caveat:.*?references them\.?\s*', '', text).strip()
+    text = re.sub(r'^DO NOT respond.*?references them\.?\s*', '', text).strip()
+    text = re.sub(r'^Implement the following plan:\s*', '', text).strip()
+    text = re.sub(r'#\s*Plan:\s*', '', text).strip()
+    text = re.sub(r'^Base directory for this skill:.*', '', text).strip()
+    text = re.sub(r'^This session is being continued.*', '', text).strip()
+    text = re.sub(r'\[Request interrupted.*?\]', '', text).strip()
+    # Strip task notification noise
+    text = re.sub(r'<task-notification>.*?</task-notification>', '', text).strip()
+    text = re.sub(r'[a-f0-9]{16,}', '', text).strip()  # hex IDs
+    text = re.sub(r'toolu_\S+', '', text).strip()  # tool use IDs
+    # Take first sentence
+    text = re.split(r'[.!?\n]', text)[0].strip()
+    # Normalize ALL CAPS to title case (less jarring)
+    if text.isupper() and len(text) > 10:
+        text = text.title()
+    # Lowercase check for noise
+    low = text.lower().strip()
+    if low in USER_NOISE or len(low) < 4:
+        return None
+    # Skip slash commands, login noise, errors, and agent output
+    if low.startswith("/") or low.startswith("cd ") or low.startswith("export "):
+        return None
+    if low.startswith("login") or low.startswith("error:") or low.startswith("completed agent"):
+        return None
+    if "interrupted" in low:
+        return None
+    return text
 
-    Bash descriptions are written by Claude in clean English like
-    'Install Inkscape for SVG conversion' — the nouns carry domain signal.
-    """
-    counts = Counter()
-    for desc in bash_descriptions:
-        tokens = re.findall(r"[a-zA-Z][\w'-]*", desc)
-        for tok in tokens:
-            low = tok.lower()
-            if len(low) < 4:
-                continue
-            if low in STOPWORDS or low in ACTION_VERBS or low in CODE_NOISE:
-                continue
-            # Skip generic bash description words
-            if low in {"command", "current", "directory", "latest", "check",
-                       "verify", "confirm", "install", "reinstall", "test",
-                       "output", "updated", "status", "working", "tree",
-                       "files", "list", "show", "display", "fetch", "search"}:
-                continue
-            counts[low] += 1
-    return counts
+
+def _best_bash_description(bash_descriptions):
+    """Pick the most descriptive bash description as a summary."""
+    SKIP = {"list files", "show working", "show tree", "check current",
+            "show git", "list contents", "check if", "run cc",
+            "list files in current", "check for"}
+    best = sorted(bash_descriptions, key=len, reverse=True)
+    for desc in best:
+        dl = desc.lower()
+        if any(dl.startswith(s) or s in dl for s in SKIP):
+            continue
+        return desc[:65]
+    return None
 
 
 def build_summary(user_messages, files_edited, files_created, bash_descriptions,
                   plan_title=None, title="", project=""):
-    """Build a concise 3-4 term summary that complements the title line."""
-    # Best case: plan title exists
+    """Build a natural-language summary of what the session was about.
+
+    Strategy: use real phrases from the session, not keyword extraction.
+    Priority: plan title > user message snippets > bash descriptions.
+    """
+    # 1. Plan title — best signal when available
     if plan_title:
         return plan_title[:80]
 
-    # Extract topic keywords (skip first message — it's the title)
-    topic_counts = extract_topic_keywords(user_messages, skip_first=True)
+    # 2. Collect user message snippets (skip first — it's the title)
+    snippets = []
+    title_low = (title + " " + project).lower()
+    for msg in user_messages[1:8]:
+        snippet = _clean_user_snippet(msg)
+        if not snippet:
+            continue
+        # Skip if it's basically the same as the title
+        if snippet.lower().strip() == title_low.strip():
+            continue
+        # Skip very short or meta messages
+        if len(snippet) < 8:
+            continue
+        snippets.append(snippet)
 
-    # Extract keywords from file paths (lower weight)
-    path_counts = extract_path_keywords(files_edited, files_created)
-    for word, count in path_counts.items():
-        topic_counts[word] += count // 2 or 1
+    # 3. Also get best bash description as a candidate
+    bash_summary = _best_bash_description(bash_descriptions)
 
-    # Cross-reference with bash description nouns (boost shared terms)
-    bash_nouns = extract_bash_nouns(bash_descriptions)
-    for word, count in bash_nouns.items():
-        if word in topic_counts:
-            topic_counts[word] += count * 2  # boost terms that appear in both
-        else:
-            topic_counts[word] += count // 2 or 1  # low weight for bash-only
+    # 4. Build the summary from best available signals
+    if snippets:
+        # Use first 2 unique snippets, truncated
+        seen = set()
+        unique = []
+        for s in snippets:
+            key = s.lower()[:30]
+            if key not in seen:
+                seen.add(key)
+                unique.append(s[:40])
+            if len(unique) >= 2:
+                break
+        summary = " → ".join(unique)
+        # If summary is very short and we have a bash description, append it
+        if len(summary) < 20 and bash_summary:
+            summary = f"{summary} → {bash_summary[:35]}"
+        return summary[:85]
 
-    # Merge case variants and normalize plurals
-    merged = Counter()
-    best_form = {}
-    for word, count in topic_counts.items():
-        norm = _normalize_keyword(word)
-        merged[norm] += count
-        if norm not in best_form:
-            best_form[norm] = word
-        elif word.isupper() and not best_form[norm].isupper():
-            best_form[norm] = word
+    # 5. Fallback to bash description
+    if bash_summary:
+        return bash_summary
 
-    # Remove words already in the title or project name (avoid redundancy)
-    title_words = set(re.findall(r"[a-zA-Z]{3,}", (title + " " + project).lower()))
-    for tw in title_words:
-        norm = _normalize_keyword(tw)
-        merged.pop(norm, None)
-
-    # Apply minimum frequency threshold: weighted count >= 2
-    # This naturally filters one-off noise words
-    merged = Counter({k: v for k, v in merged.items() if v >= 2})
-
-    if not merged:
-        # Fallback: use the most descriptive bash description
-        if bash_descriptions:
-            # Pick the longest description (most specific)
-            best_desc = sorted(bash_descriptions, key=len, reverse=True)
-            for desc in best_desc:
-                # Skip generic descriptions
-                dl = desc.lower()
-                if any(skip in dl for skip in ["list files", "show working",
-                                                "show tree", "check current"]):
-                    continue
-                return desc[:60]
-        return ""
-
-    # Take only top 4 keywords (scannable, not a word cloud)
-    top = merged.most_common(4)
-    keywords = [best_form[norm] for norm, _ in top]
-
-    summary = ", ".join(keywords)
-
-    # Truncate at comma boundary around 55 chars
-    if len(summary) > 55:
-        cut = summary[:55].rfind(",")
-        if cut > 10:
-            summary = summary[:cut]
-
-    return summary
+    return ""
 
 
 def scan_sessions():
