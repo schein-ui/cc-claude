@@ -658,6 +658,7 @@ def scan_sessions():
                 "tools_used": sorted(tools_used - {""}),
                 "files_edited": sorted(files_edited),
                 "files_created": sorted(files_created),
+                "search_text": " ".join(user_messages[:20]).lower(),
             })
 
     # Non-empty summaries first (by date desc), then empty summaries at bottom (by date desc)
@@ -877,7 +878,8 @@ def cmd_search(sessions, tags, keyword):
         title = (session.get("title") or "").lower()
         project = (session.get("project") or "").lower()
         summary = (session.get("summary") or "").lower()
-        if keyword_lower in msg or keyword_lower in tag or keyword_lower in title or keyword_lower in project or keyword_lower in summary:
+        search_text = session.get("search_text", "")
+        if keyword_lower in msg or keyword_lower in tag or keyword_lower in title or keyword_lower in project or keyword_lower in summary or keyword_lower in search_text:
             matches.append((i, session))
 
     if not matches:
