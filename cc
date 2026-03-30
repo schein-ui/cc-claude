@@ -757,8 +757,12 @@ def format_session_line(num, session, tags):
     # Line 1: number, date, title, project
     line1 = f"  {num_str}  {date_part}  {size} {name_part}{proj_part}"
 
-    # Line 2: stats — turns, duration, tools
+    # Line 2: stats — started, last active, turns, duration, tools
+    start_date = format_date(session["timestamp"])
+    start_time = format_time(session["timestamp"])
     stats = []
+    stats.append(f"started {start_date} {start_time}")
+    stats.append(f"last {last_date} {last_time}")
     stats.append(f"{turns} turns")
     if duration:
         stats.append(duration)
