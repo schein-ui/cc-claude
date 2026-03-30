@@ -731,12 +731,30 @@ def truncate(s, maxlen=MAX_MSG_LEN):
     return s[:maxlen] + "..." if len(s) > maxlen else s
 
 
+GENERIC_TITLES = frozenset({
+    "update claude", "update claude code", "update", "auto mode", "auto",
+    "cc", "test", "is this working", "-", "claude", "remote-control",
+    "export anthropic_api_key", "login",
+})
+
+
 def get_display_name(session, tags):
-    """Get the best name for a session: user tag > auto-title."""
+    """Get the best name for a session: user tag > summary (if title is generic) > auto-title."""
     tag = tags.get(session["session_id"])
     if tag:
         return tag
-    return session.get("title") or truncate(session["first_message"], 50)
+    title = session.get("title") or ""
+    summary = session.get("summary") or ""
+    # If the title is generic/meta, use the summary as the display name
+    if title.lower().strip() in GENERIC_TITLES or len(title.strip()) <= 2:
+        if summary and len(summary) > 10:
+            return summary[:60]
+    # If the title starts with generic prefixes, prefer summary
+    title_low = title.lower().strip()
+    if title_low.startswith(("update clau", "update code")):
+        if summary and len(summary) > 10:
+            return summary[:60]
+    return title or truncate(session["first_message"], 50)
 
 
 TOOL_LABELS = {
@@ -808,8 +826,8 @@ def format_session_line(num, session, tags):
 
     lines = [line1, line2]
 
-    # Line 3: summary — purpose of the session
-    if summary:
+    # Line 3: summary — purpose of the session (skip if already used as display name)
+    if summary and summary[:60] != name[:60]:
         summary_display = summary[:90]
         lines.append(f"        {yellow(summary_display)}")
 
