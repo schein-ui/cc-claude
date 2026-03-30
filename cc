@@ -587,7 +587,8 @@ def scan_sessions():
                 "files_created": sorted(files_created),
             })
 
-    sessions.sort(key=lambda s: s["last_active"], reverse=True)
+    # Non-empty summaries first (by date desc), then empty summaries at bottom (by date desc)
+    sessions.sort(key=lambda s: (bool(s.get("summary")), s["last_active"]), reverse=True)
     return sessions
 
 
