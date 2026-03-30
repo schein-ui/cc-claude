@@ -409,6 +409,11 @@ def _clean_user_snippet(msg):
         return None
     if "interrupted" in low:
         return None
+    # Skip skill/plugin definitions and escaped paths
+    if low.startswith("# /") or low.startswith("#/"):
+        return None
+    if "\\" in text:  # escaped shell paths
+        return None
     return text
 
 
@@ -437,10 +442,10 @@ def build_summary(user_messages, files_edited, files_created, bash_descriptions,
     if plan_title:
         return plan_title[:80]
 
-    # 2. Collect user message snippets (skip first — it's the title)
+    # 2. Collect cleaned user message snippets (skip first — it's the title)
     snippets = []
     title_low = (title + " " + project).lower()
-    for msg in user_messages[1:8]:
+    for msg in user_messages[1:15]:
         snippet = _clean_user_snippet(msg)
         if not snippet:
             continue
@@ -448,30 +453,18 @@ def build_summary(user_messages, files_edited, files_created, bash_descriptions,
         if snippet.lower().strip() == title_low.strip():
             continue
         # Skip very short or meta messages
-        if len(snippet) < 8:
+        if len(snippet) < 12:
             continue
         snippets.append(snippet)
 
     # 3. Also get best bash description as a candidate
     bash_summary = _best_bash_description(bash_descriptions)
 
-    # 4. Build the summary from best available signals
+    # 4. Pick the MOST DESCRIPTIVE snippet — the longest one describes the real intent
     if snippets:
-        # Use first 2 unique snippets, truncated
-        seen = set()
-        unique = []
-        for s in snippets:
-            key = s.lower()[:30]
-            if key not in seen:
-                seen.add(key)
-                unique.append(s[:40])
-            if len(unique) >= 2:
-                break
-        summary = " → ".join(unique)
-        # If summary is very short and we have a bash description, append it
-        if len(summary) < 20 and bash_summary:
-            summary = f"{summary} → {bash_summary[:35]}"
-        return summary[:85]
+        # Sort by length descending — longest message = most descriptive
+        best = sorted(snippets, key=len, reverse=True)[0]
+        return best[:85]
 
     # 5. Fallback to bash description
     if bash_summary:
