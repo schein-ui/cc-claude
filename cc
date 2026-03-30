@@ -435,10 +435,10 @@ def _first_bash_description(bash_descriptions):
 
 # Intent verbs that signal the PURPOSE of a session
 _INTENT_RE = re.compile(
-    r'\b(improve|refine|optimize|fix|build|create|add|configure|setup|set up|'
-    r'migrate|deploy|design|implement|install|update|upgrade|scaffold|'
+    r'\b(improve|refine|optimize|fix|build|create|configure|setup|set up|'
+    r'migrate|deploy|design|implement|install|upgrade|scaffold|'
     r'review|analyze|debug|rewrite|restructure|convert|extract|generate|'
-    r'run|simulate|stream|download|clone|pull|push)\b\s+(.+)',
+    r'simulate|stream|download)\b\s+(.+)',
     re.IGNORECASE
 )
 
@@ -486,29 +486,26 @@ def build_summary(user_messages, files_edited, files_created, bash_descriptions,
             continue
         snippets.append(snippet)
 
-    # 3. Try to extract an intent phrase (verb + object)
+    # 3. Collect ALL intent phrases, then pick the best (longest = most descriptive)
+    intents = []
     for snippet in snippets:
         intent = _extract_intent(snippet)
         if intent:
-            return intent
+            intents.append(intent)
+    if intents:
+        # Longest intent is most likely the real purpose statement
+        best_intent = max(intents, key=len)
+        return best_intent
 
     # 4. Try the first substantive bash description — captures what Claude did
     bash_summary = _first_bash_description(bash_descriptions)
-
-    # 5. Fallback: prefer a medium-length snippet (purpose-length, not a tangent)
-    #    Sort by how close to 40 chars (ideal purpose statement length)
-    candidates = [s for s in snippets if len(s) >= 20]
-    if candidates:
-        # Prefer snippets that look like purpose statements (contain a verb)
-        purpose_like = [s for s in candidates if _INTENT_RE.search(s)]
-        if purpose_like:
-            return purpose_like[0][:75]
-        # Otherwise pick the first medium-length one
-        return candidates[0][:75]
-
-    # 6. Last resort: bash description
     if bash_summary:
         return bash_summary
+
+    # 5. Fallback: longest clean snippet
+    candidates = [s for s in snippets if len(s) >= 20]
+    if candidates:
+        return max(candidates, key=len)[:75]
 
     return ""
 
