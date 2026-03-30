@@ -417,26 +417,56 @@ def _clean_user_snippet(msg):
     return text
 
 
-def _best_bash_description(bash_descriptions):
-    """Pick the most descriptive bash description as a summary."""
+def _first_bash_description(bash_descriptions):
+    """Pick the first substantive bash description — it often captures purpose."""
     SKIP = {"list files", "show working", "show tree", "check current",
-            "show git", "list contents", "check if", "run cc",
-            "list files in current", "check for"}
-    best = sorted(bash_descriptions, key=len, reverse=True)
-    for desc in best:
+            "show git", "list contents", "check if", "run cc", "check for",
+            "list files in current", "show status", "check version",
+            "list directory", "read file", "show output"}
+    for desc in bash_descriptions:
         dl = desc.lower()
         if any(dl.startswith(s) or s in dl for s in SKIP):
             continue
-        return desc[:65]
+        if len(desc) < 15:
+            continue
+        return desc[:75]
+    return None
+
+
+# Intent verbs that signal the PURPOSE of a session
+_INTENT_RE = re.compile(
+    r'\b(improve|refine|optimize|fix|build|create|add|configure|setup|set up|'
+    r'migrate|deploy|design|implement|install|update|upgrade|scaffold|'
+    r'review|analyze|debug|rewrite|restructure|convert|extract|generate|'
+    r'run|simulate|stream|download|clone|pull|push)\b\s+(.+)',
+    re.IGNORECASE
+)
+
+
+def _extract_intent(snippet):
+    """Try to extract a verb+object intent phrase from a user snippet.
+
+    Only returns a match if the object is substantial enough to be a purpose
+    statement (15+ chars). Short matches like 'run it' are skipped.
+    """
+    m = _INTENT_RE.search(snippet)
+    if m:
+        verb = m.group(1).lower()
+        obj = m.group(2).strip()
+        # Take up to the first comma, dash, or sentence break
+        obj = re.split(r'[,\-—;]', obj)[0].strip()
+        # Must be a substantial phrase, not "run it" or "add this"
+        if len(obj) >= 15:
+            return f"{verb} {obj}"[:75]
     return None
 
 
 def build_summary(user_messages, files_edited, files_created, bash_descriptions,
                   plan_title=None, title="", project=""):
-    """Build a natural-language summary of what the session was about.
+    """Build a purpose-driven summary of what the session was about.
 
-    Strategy: use real phrases from the session, not keyword extraction.
-    Priority: plan title > user message snippets > bash descriptions.
+    Strategy: find the user's INTENT — what they wanted to accomplish.
+    Priority: plan title > intent phrase from user messages > first bash description > longest snippet.
     """
     # 1. Plan title — best signal when available
     if plan_title:
@@ -445,28 +475,38 @@ def build_summary(user_messages, files_edited, files_created, bash_descriptions,
     # 2. Collect cleaned user message snippets (skip first — it's the title)
     snippets = []
     title_low = (title + " " + project).lower()
-    for msg in user_messages[1:15]:
+    for msg in user_messages[1:20]:
         snippet = _clean_user_snippet(msg)
         if not snippet:
             continue
         # Skip if it's basically the same as the title
         if snippet.lower().strip() == title_low.strip():
             continue
-        # Skip very short or meta messages
         if len(snippet) < 12:
             continue
         snippets.append(snippet)
 
-    # 3. Also get best bash description as a candidate
-    bash_summary = _best_bash_description(bash_descriptions)
+    # 3. Try to extract an intent phrase (verb + object)
+    for snippet in snippets:
+        intent = _extract_intent(snippet)
+        if intent:
+            return intent
 
-    # 4. Pick the MOST DESCRIPTIVE snippet — the longest one describes the real intent
-    if snippets:
-        # Sort by length descending — longest message = most descriptive
-        best = sorted(snippets, key=len, reverse=True)[0]
-        return best[:85]
+    # 4. Try the first substantive bash description — captures what Claude did
+    bash_summary = _first_bash_description(bash_descriptions)
 
-    # 5. Fallback to bash description
+    # 5. Fallback: prefer a medium-length snippet (purpose-length, not a tangent)
+    #    Sort by how close to 40 chars (ideal purpose statement length)
+    candidates = [s for s in snippets if len(s) >= 20]
+    if candidates:
+        # Prefer snippets that look like purpose statements (contain a verb)
+        purpose_like = [s for s in candidates if _INTENT_RE.search(s)]
+        if purpose_like:
+            return purpose_like[0][:75]
+        # Otherwise pick the first medium-length one
+        return candidates[0][:75]
+
+    # 6. Last resort: bash description
     if bash_summary:
         return bash_summary
 
@@ -729,13 +769,20 @@ def format_session_line(num, session, tags):
 
     lines = [line1, line2]
 
-    # Line 3: summary of what happened
+    # Line 3: summary — purpose of the session
     if summary:
-        # Truncate to terminal width
         summary_display = summary[:90]
-        if len(summary) > 90:
-            summary_display += "..."
         lines.append(f"        {yellow(summary_display)}")
+
+    # Line 4: file activity context for substantial sessions
+    n_edited = len(session.get("files_edited", []))
+    n_created = len(session.get("files_created", []))
+    n_files = n_edited + n_created
+    if n_files > 0:
+        file_note = f"{n_files} files touched"
+        if n_edited and n_created:
+            file_note = f"{n_edited} edited, {n_created} created"
+        lines.append(f"        {dim(file_note)}")
 
     lines.append("")  # blank line between sessions
 
