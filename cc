@@ -3,6 +3,11 @@
 
 import sys
 import os
+
+# Fix Windows console encoding for Unicode output
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 import json
 import re
 from pathlib import Path
@@ -573,7 +578,7 @@ def scan_sessions():
         plan_title = None
 
         try:
-            with open(path) as f:
+            with open(path, encoding="utf-8", errors="replace") as f:
                 for line in f:
                     try:
                         obj = json.loads(line)
