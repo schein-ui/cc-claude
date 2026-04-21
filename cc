@@ -153,6 +153,7 @@ def bold(s):   return f"\033[1m{s}\033[0m" if USE_COLOR else s
 def white(s):  return f"\033[97m{s}\033[0m" if USE_COLOR else s
 def cyan(s):   return f"\033[36m{s}\033[0m" if USE_COLOR else s
 def yellow(s): return f"\033[33m{s}\033[0m" if USE_COLOR else s
+def magenta(s): return f"\033[35m{s}\033[0m" if USE_COLOR else s
 
 
 # === Core Functions ===
@@ -243,27 +244,55 @@ def auto_title(msg):
     return text[:60]
 
 
+# Tool-internal path prefixes (relative to home) that are not real projects —
+# Claude Code chdirs into these as part of its own session bookkeeping, so they
+# would otherwise leak into the "project" column.
+_TOOL_INTERNAL_PREFIXES = (
+    "/.claude/projects",
+    "/.claude/sessions",
+    "/.claude/cache",
+    "/.claude/plugins/cache",
+)
+
+
+def _norm_path(p):
+    """Normalize path separators and trailing slashes for comparison."""
+    if not p:
+        return ""
+    return p.replace("\\", "/").rstrip("/")
+
+
 def project_from_cwd(cwd):
-    """Extract a short project name from the working directory."""
+    """Extract a short project name from the working directory.
+
+    Returns the deepest meaningful directory name. Home itself and Claude's
+    own internal state directories (e.g. ~/.claude/projects/<uuid>) return
+    None so they don't show up as fake projects.
+    """
     if not cwd:
         return None
-    home = str(Path.home())
-    if cwd == home:
-        return None  # home dir, no specific project
-    if cwd.startswith(home + "/"):
-        rel = cwd[len(home) + 1:]
-        # First path component is the project
-        return rel.split("/")[0]
-    return os.path.basename(cwd)
+    norm = _norm_path(cwd)
+    home = _norm_path(str(Path.home()))
+    if not norm or norm == home:
+        return None
+    # Filter out Claude Code's internal session/plugin dirs
+    for prefix in _TOOL_INTERNAL_PREFIXES:
+        root = home + prefix
+        if norm == root or norm.startswith(root + "/"):
+            return None
+    # Deepest path component is the most specific "project" label
+    return norm.rsplit("/", 1)[-1] or None
 
 
 def best_project(cwd_counts):
     """Pick the best project from a counter of cwds seen in a session."""
-    home = str(Path.home())
-    # Prefer non-home directories
+    home = _norm_path(str(Path.home()))
     for cwd, _count in cwd_counts.most_common():
-        if cwd != home:
-            return project_from_cwd(cwd)
+        if _norm_path(cwd) == home:
+            continue
+        proj = project_from_cwd(cwd)
+        if proj:
+            return proj
     return None
 
 
@@ -571,6 +600,7 @@ def scan_sessions():
         user_turns = 0
         last_timestamp = None
         tools_used = set()
+        skills_used = set()
         assistant_turns = 0
         files_edited = set()
         files_created = set()
@@ -624,6 +654,11 @@ def scan_sessions():
                                     tool_name = item.get("name", "")
                                     tools_used.add(tool_name)
                                     inp = item.get("input", {})
+                                    # Track skills used
+                                    if tool_name == "Skill":
+                                        skill_name = inp.get("skill", "")
+                                        if skill_name:
+                                            skills_used.add(skill_name)
                                     # Track files edited/created
                                     if tool_name == "Edit":
                                         fp = inp.get("file_path", "")
@@ -661,6 +696,7 @@ def scan_sessions():
                 "assistant_turns": assistant_turns,
                 "duration": duration,
                 "tools_used": sorted(tools_used - {""}),
+                "skills_used": sorted(skills_used - {""}),
                 "files_edited": sorted(files_edited),
                 "files_created": sorted(files_created),
                 "search_text": " ".join(user_messages[:20]).lower(),
@@ -836,7 +872,13 @@ def format_session_line(num, session, tags):
         summary_display = summary[:90]
         lines.append(f"        {yellow(summary_display)}")
 
-    # Line 4: file activity context for substantial sessions
+    # Line 4: skills used
+    skills = session.get("skills_used", [])
+    if skills:
+        skill_str = ", ".join(f"/{s}" for s in skills)
+        lines.append(f"        {magenta(skill_str)}")
+
+    # Line 5: file activity context for substantial sessions
     n_edited = len(session.get("files_edited", []))
     n_created = len(session.get("files_created", []))
     n_files = n_edited + n_created
@@ -943,13 +985,26 @@ def cmd_tag(sessions, tags, identifier, tag_name):
 
 def _do_resume(session, tags):
     """Launch claude --resume for the given session."""
+    import subprocess
     session_id = session["session_id"]
     name = get_display_name(session, tags)
     print(f"\n  Resuming {green(name)}...\n")
 
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
-    os.execvpe("claude", ["claude", "--resume", session_id], env)
+    import shutil
+    claude_path = shutil.which("claude")
+    if not claude_path:
+        print("Error: 'claude' not found on PATH", file=sys.stderr)
+        sys.exit(1)
+    print(f"  DEBUG: launching {claude_path} --resume {session_id[:8]}...")
+    sys.stdout.flush()
+    if sys.platform == "win32":
+        result = subprocess.call([claude_path, "--resume", session_id], env=env, shell=True)
+        print(f"  DEBUG: exit code = {result}")
+        sys.exit(result)
+    else:
+        os.execvpe("claude", ["claude", "--resume", session_id], env)
 
 
 def cmd_resume(sessions, tags, identifier=None):
