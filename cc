@@ -679,6 +679,9 @@ def scan_sessions():
             duration = format_duration(timestamp, last_timestamp or timestamp)
             session_title = auto_title(first_message)
             session_project = best_project(cwd_counts) or ""
+            # Remember the session's original cwd — claude --resume needs to
+            # run from it or it won't find the session.
+            session_cwd = cwd_counts.most_common(1)[0][0] if cwd_counts else None
             summary = build_summary(
                 user_messages, files_edited, files_created, bash_descriptions,
                 plan_title, title=session_title, project=session_project,
@@ -692,6 +695,7 @@ def scan_sessions():
                 "summary": summary,
                 "slug": slug,
                 "project": session_project or None,
+                "cwd": session_cwd,
                 "user_turns": user_turns,
                 "assistant_turns": assistant_turns,
                 "duration": duration,
@@ -986,24 +990,43 @@ def cmd_tag(sessions, tags, identifier, tag_name):
 def _do_resume(session, tags):
     """Launch claude --resume for the given session."""
     import subprocess
+    import shutil
     session_id = session["session_id"]
     name = get_display_name(session, tags)
     print(f"\n  Resuming {green(name)}...\n")
+    sys.stdout.flush()
 
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
-    import shutil
     claude_path = shutil.which("claude")
     if not claude_path:
         print("Error: 'claude' not found on PATH", file=sys.stderr)
         sys.exit(1)
-    print(f"  DEBUG: launching {claude_path} --resume {session_id[:8]}...")
-    sys.stdout.flush()
+
+    # claude --resume only searches the current project bucket, so launch from
+    # the session's original cwd. Fall back to the current dir if unknown or
+    # if the directory no longer exists.
+    launch_cwd = session.get("cwd")
+    if launch_cwd and not os.path.isdir(launch_cwd):
+        print(f"  Note: original cwd {launch_cwd!r} no longer exists; resuming from current dir.",
+              file=sys.stderr)
+        launch_cwd = None
+
     if sys.platform == "win32":
-        result = subprocess.call([claude_path, "--resume", session_id], env=env, shell=True)
-        print(f"  DEBUG: exit code = {result}")
+        # Don't use shell=True — the cmd.exe shim mangles claude's TUI escape
+        # sequences and leaks stray characters back into the parent shell.
+        result = subprocess.call([claude_path, "--resume", session_id],
+                                 env=env, cwd=launch_cwd)
+        # Claude's TUI can leave bracketed-paste / focus-report / mouse-report
+        # modes enabled on exit; PowerShell then interprets the terminal's
+        # response bytes as commands. Reset those modes and soft-reset the
+        # terminal to absorb any stray sequences.
+        sys.stdout.write("\x1b[?2004l\x1b[?1004l\x1b[?1003l\x1b[?1000l\x1b[?25h\x1b[!p")
+        sys.stdout.flush()
         sys.exit(result)
     else:
+        if launch_cwd:
+            os.chdir(launch_cwd)
         os.execvpe("claude", ["claude", "--resume", session_id], env)
 
 
