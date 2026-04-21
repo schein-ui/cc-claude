@@ -1015,8 +1015,12 @@ def _do_resume(session, tags):
     if sys.platform == "win32":
         # Don't use shell=True — the cmd.exe shim mangles claude's TUI escape
         # sequences and leaks stray characters back into the parent shell.
-        result = subprocess.call([claude_path, "--resume", session_id],
-                                 env=env, cwd=launch_cwd)
+        # Use os.chdir() rather than subprocess.call's cwd= kwarg: claude.EXE
+        # doesn't honor the child-process cwd when computing its project slug,
+        # so we have to change the directory in the parent first.
+        if launch_cwd:
+            os.chdir(launch_cwd)
+        result = subprocess.call([claude_path, "--resume", session_id], env=env)
         # Claude's TUI can leave bracketed-paste / focus-report / mouse-report
         # modes enabled on exit; PowerShell then interprets the terminal's
         # response bytes as commands. Reset those modes and soft-reset the
